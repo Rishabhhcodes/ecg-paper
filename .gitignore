@@ -1,0 +1,27 @@
+# Data and results — regenerate these, never commit them.
+# MIT-BIH is ~90 MB and the artifacts are derived from it. Committing
+# either makes the repo unclonable and creates merge conflicts on
+# binary files that git cannot resolve.
+data/
+artifacts/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large or transient outputs
+*.npz
+*.pth
+*.pt
+*.log
+nohup.out

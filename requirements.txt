@@ -1,0 +1,4 @@
+# Stage 1 — data preparation
+wfdb>=4.1.0
+numpy>=1.24
+scipy>=1.10
