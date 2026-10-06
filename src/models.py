@@ -133,18 +133,47 @@ def make_cnn(use_rr, n_classes=5, seed=0):
             self.pool = nn.AdaptiveAvgPool1d(1)
             self.drop = nn.Dropout(0.3)
 
-            head_in = ch[-1] + (4 if use_rr else 0)
+            # RR branch. Three things matter here, and the first version of
+            # this model got all three wrong, which left the CNN scoring
+            # S-class F1 around 0.06 while XGBoost on the same folds reached
+            # 0.27. The CNN was reading morphology fine (it beat XGBoost on V)
+            # and simply failing to use timing.
+            #
+            #   1. The four RR values are raw: seconds (~0.8) and ratios
+            #      (~1.0). The conv features arrive from BatchNorm -> ReLU ->
+            #      global average pooling on an entirely different scale.
+            #      BatchNorm1d here puts both branches on comparable footing.
+            #
+            #   2. Four inputs beside 128 conv features is 3% of the vector.
+            #      Projecting them to RR_DIM gives the timing signal enough
+            #      width for the head to actually lean on it.
+            #
+            #   3. Dropout used to be applied AFTER the concatenation, so
+            #      each RR feature was zeroed 30% of the time. With only four
+            #      features carrying the sole timing signal, that is not
+            #      regularisation, it is deletion. Dropout now applies to the
+            #      conv branch only.
+            RR_DIM = 32
+            self.use_rr = use_rr
+            if use_rr:
+                self.rr_proj = nn.Sequential(
+                    nn.BatchNorm1d(4),
+                    nn.Linear(4, RR_DIM), nn.ReLU(inplace=True),
+                    nn.Linear(RR_DIM, RR_DIM), nn.ReLU(inplace=True),
+                )
+
+            head_in = ch[-1] + (RR_DIM if use_rr else 0)
             self.head = nn.Sequential(
                 nn.Linear(head_in, 64), nn.ReLU(inplace=True),
                 nn.Dropout(0.3), nn.Linear(64, n_classes),
             )
-            self.use_rr = use_rr
 
         def forward(self, x, rr=None):
             h = self.pool(self.conv(x.unsqueeze(1))).squeeze(-1)
+            h = self.drop(h)                      # conv branch only
             if self.use_rr:
-                h = torch.cat([h, rr], dim=1)
-            return self.head(self.drop(h))
+                h = torch.cat([h, self.rr_proj(rr)], dim=1)
+            return self.head(h)
 
     return CNN1D()
 
