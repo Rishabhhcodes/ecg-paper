@@ -1,5 +1,5 @@
 """
-Box 10 — the four imbalance strategies.
+Box 10 — the five imbalance strategies.
 
 Rules enforced here, because getting these wrong is how Paper #1's
 precision collapsed and how leaks get reintroduced:
@@ -7,17 +7,21 @@ precision collapsed and how leaks get reintroduced:
   1. Resampling is fitted on the TRAINING FOLD ONLY. Never on the
      validation fold, never before the split. A synthetic twin of a
      validation beat appearing in training is a silent leak.
-  2. ADASYN is capped at CAP_RATIO of the majority class, not full
-     parity. Paper #1 oversampled to full parity (72,471 per class)
-     and macro precision fell 0.80 -> 0.45. Partial rebalancing is
-     the validated recipe.
+  2. Oversampling is capped at CAP_RATIO of the majority class, not
+     full parity. Paper #1 oversampled to full parity (72,471 per
+     class) and macro precision fell 0.80 -> 0.45. Partial rebalancing
+     is the validated recipe.
   3. Strategies are evaluated SEPARATELY, never stacked. Focal loss
      up-weights hard examples; ADASYN synthesises more samples near
      hard examples. Same lever pulled twice.
+  4. ADASYN and SMOTE are two SEPARATE rows, and neither falls back to
+     the other. They are being compared against each other, so a
+     sampler that cannot fit must report the failure rather than
+     silently becoming the one it is being compared with.
 """
 import numpy as np
 
-STRATEGIES = ['none', 'class_weight', 'focal', 'adasyn']
+STRATEGIES = ['none', 'class_weight', 'focal', 'adasyn', 'smote']
 
 # Minority classes are oversampled to at most this fraction of the
 # majority class count. 0.35 follows the recipe reported for compact
@@ -27,8 +31,14 @@ CAP_RATIO = 0.35
 # A class needs at least this many samples in the training fold to be
 # synthesised from — interpolation needs neighbours. Below it, the class
 # is excluded from the resampling strategy rather than being allowed to
-# fail the whole call. See the comment in apply_adasyn.
+# fail the whole call. See the comment in apply_resample.
 MIN_SAMPLES_TO_RESAMPLE = 6
+
+# The two samplers spell the neighbour argument differently: ADASYN
+# takes `n_neighbors`, SMOTE takes `k_neighbors`. Passing the wrong one
+# raises TypeError, which silently disabled the SMOTE fallback in the
+# first version of this module until it was caught.
+_SAMPLERS = {'adasyn': 'n_neighbors', 'smote': 'k_neighbors'}
 
 
 def class_weights(y, n_classes=5):
@@ -44,19 +54,31 @@ def sample_weights(y, n_classes=5):
     return class_weights(y, n_classes)[y]
 
 
-def apply_adasyn(X, y, cap_ratio=CAP_RATIO, seed=0):
+def apply_resample(X, y, kind, cap_ratio=CAP_RATIO, seed=0):
     """Oversample minorities to `cap_ratio` x majority count.
 
-    X must be 2-D. For the CNN the waveform is flattened before this
-    call and reshaped afterwards; see the caveat in the module docstring
-    of models.py — interpolating between raw waveforms can produce beats
-    that are not physiologically plausible, which is why the cap matters.
+    `kind` is 'adasyn' or 'smote'. There is deliberately NO fallback
+    from one to the other: the two are separate rows in the grid and
+    exist to be compared, so a sampler that cannot fit reports that in
+    the returned note instead of quietly handing the work to its rival.
+    A row of results produced by the other sampler would be worse than
+    no row at all.
 
-    Falls back to SMOTE, then to no resampling, if ADASYN cannot fit
-    (it fails when a minority class has too few neighbours, which does
-    happen for class F in some folds).
+    X must be 2-D. For the CNN the waveform and the RR columns are
+    stacked into one matrix before this call and split afterwards, so
+    the sampler interpolates both together — see the caveat in the
+    module docstring of models.py. Interpolating between raw waveforms
+    can produce beats that are not physiologically plausible, which is
+    both why the cap matters and why ADASYN is the best strategy for
+    XGBoost and the worst for the CNN.
+
+    Returns (X, y, note). The note records what actually happened and
+    is written into each prediction file's metadata.
     """
     from imblearn.over_sampling import ADASYN, SMOTE
+
+    sampler_cls = {'adasyn': ADASYN, 'smote': SMOTE}[kind]
+    kw_name = _SAMPLERS[kind]
 
     counts = np.bincount(y, minlength=5)
     n_major = counts.max()
@@ -71,10 +93,11 @@ def apply_adasyn(X, y, cap_ratio=CAP_RATIO, seed=0):
     # which lands as 0-3 per fold.
     #
     # Leaving such a class IN the strategy makes the whole fit_resample
-    # call raise, which sends us down the fallback chain and returns the
-    # data completely unresampled — so the 'adasyn' row comes out byte
-    # identical to the 'none' row and the comparison is silently void.
-    # Excluding it lets S, V and F still be resampled, which is the point.
+    # call raise, which returns the data completely unresampled — so the
+    # 'adasyn' row comes out byte identical to the 'none' row and the
+    # comparison is silently void. That is exactly what happened before
+    # MIN_SAMPLES_TO_RESAMPLE existed. Excluding it lets S, V and F still
+    # be resampled, which is the point.
     strategy = {c: target for c in range(5)
                 if MIN_SAMPLES_TO_RESAMPLE <= counts[c] < target}
     if not strategy:
@@ -86,26 +109,20 @@ def apply_adasyn(X, y, cap_ratio=CAP_RATIO, seed=0):
     note = '' if not skipped else \
         '+skipped' + ''.join(str(c) for c in skipped)
 
-    # The two samplers spell the neighbour argument differently:
-    # ADASYN takes `n_neighbors`, SMOTE takes `k_neighbors`. Passing the
-    # wrong one raises TypeError, which silently disabled the SMOTE
-    # fallback until this was caught.
     k = min(5, max(1, min(counts[c] for c in strategy) - 1))
-    attempts = (
-        ('adasyn', ADASYN, {'n_neighbors': k}),
-        ('smote', SMOTE, {'k_neighbors': k}),
-    )
 
-    last = 'none'
-    for name, Sampler, kw in attempts:
-        try:
-            sampler = Sampler(sampling_strategy=strategy,
-                              random_state=seed, **kw)
-            Xr, yr = sampler.fit_resample(X, y)
-            return Xr, yr, name + note
-        except Exception as exc:                      # noqa: BLE001
-            last = f'{name}:{type(exc).__name__}'
-    return X, y, f'failed_{last}'
+    try:
+        sampler = sampler_cls(sampling_strategy=strategy,
+                              random_state=seed, **{kw_name: k})
+        Xr, yr = sampler.fit_resample(X, y)
+        return Xr, yr, kind + note
+    except Exception as exc:                          # noqa: BLE001
+        return X, y, f'{kind}_failed:{type(exc).__name__}{note}'
+
+
+def apply_adasyn(X, y, cap_ratio=CAP_RATIO, seed=0):
+    """Back-compat wrapper. Prefer apply_resample(X, y, 'adasyn')."""
+    return apply_resample(X, y, 'adasyn', cap_ratio=cap_ratio, seed=seed)
 
 
 def focal_loss_torch(logits, target, gamma=2.0, alpha=None):

@@ -1,7 +1,7 @@
 """
 Boxes 8 & 11 — run the experimental grid on DS1 with patient-grouped CV.
 
-    3 models x 4 imbalance strategies x 2 RR settings x 5 folds
+    3 models x 5 imbalance strategies x 2 RR settings x 5 folds
 
 DS2 is never opened by this script. Not once. That is the protocol.
 
@@ -32,11 +32,14 @@ from sklearn.model_selection import StratifiedGroupKFold
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C
-from imbalance import STRATEGIES, apply_adasyn, sample_weights
+from imbalance import STRATEGIES, apply_resample, sample_weights
 from models import build_features, make_lr, make_xgb
 
 N_FOLDS = 5
 PRED_DIR = os.path.join(C.OUT_DIR, 'preds')
+
+# Strategies that act on the training data rather than on the objective.
+RESAMPLING_STRATEGIES = ('adasyn', 'smote')
 
 
 def tag(model, strategy, use_rr, fold):
@@ -49,9 +52,15 @@ def fit_sklearn_like(kind, strategy, Xtr, rrtr, ytr, Xva, rrva, use_rr, seed):
     Fva = build_features(Xva, rrva, use_rr, C.SEGMENTS, kind)
 
     note = 'none'
-    if strategy == 'adasyn':
-        # Fitted on the training fold only — never the validation fold.
-        Ftr, ytr, note = apply_adasyn(Ftr, ytr, seed=seed)
+    # Resampling happens in FEATURE space, on Ftr — not on the raw
+    # waveform. For XGBoost that means ADASYN and SMOTE interpolate
+    # between morphology descriptors, where a midpoint is still a valid
+    # statistic. That difference from the CNN path, which interpolates
+    # raw waveforms, is the whole basis of the ADASYN result.
+    #
+    # Fitted on the training fold only — never the validation fold.
+    if strategy in RESAMPLING_STRATEGIES:
+        Ftr, ytr, note = apply_resample(Ftr, ytr, strategy, seed=seed)
 
     if kind == 'lr':
         model = make_lr(strategy, seed)
@@ -133,14 +142,24 @@ def run(models, strategies, rr_settings, subset=None, seed=0, epochs=40):
                     if model == 'cnn':
                         from train_cnn import train_cnn
                         Xtr, rrtr, ytr = X[tr], rr[tr], y[tr]
-                        if strategy == 'adasyn':
+                        note = 'none'
+                        # The CNN resamples in WAVEFORM space. The 216
+                        # waveform columns and the 4 RR columns are stacked
+                        # into one matrix, so the sampler interpolates both
+                        # together and the shape-to-timing correspondence is
+                        # not preserved in synthetic beats. This is the
+                        # counterpart to the feature-space path above.
+                        if strategy in RESAMPLING_STRATEGIES:
                             flat = np.hstack([Xtr, rrtr])
-                            flat, ytr, _ = apply_adasyn(flat, ytr, seed=seed)
-                            Xtr, rrtr = flat[:, :X.shape[1]], flat[:, X.shape[1]:]
+                            flat, ytr, note = apply_resample(
+                                flat, ytr, strategy, seed=seed)
+                            Xtr = flat[:, :X.shape[1]]
+                            rrtr = flat[:, X.shape[1]:]
                         proba, meta = train_cnn(
                             Xtr, rrtr, ytr, X[va], rr[va], y[va],
                             use_rr=use_rr, strategy=strategy,
                             epochs=epochs, seed=seed, verbose=False)
+                        meta['resample'] = note
                     else:
                         proba, meta = fit_sklearn_like(
                             model, strategy, X[tr], rr[tr], y[tr],
