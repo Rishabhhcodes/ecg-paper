@@ -1,13 +1,14 @@
 """
 Boxes 8 & 11 — run the experimental grid on DS1 with patient-grouped CV.
 
-    3 models x 4 imbalance strategies x 2 RR settings x 5 folds
+    3 models x 5 imbalance strategies x 2 RR settings x 5 folds
 
 DS2 is never opened by this script. Not once. That is the protocol.
 
 Macro-F1 is averaged over config.EVAL_CLASSES (N, S, V, F). Q is still a
 model output and its per-class F1 is still reported, but it is left out
-of the average — see the note in config.py for why.
+of the average — see the note in config.py for why. Q is also left out
+of the training objective entirely; see rule 5 in imbalance.py.
 
 Every fold writes its validation predictions to
 artifacts/preds/{model}_{strategy}_{rr}_f{fold}.npz, and the script skips
@@ -32,11 +33,14 @@ from sklearn.model_selection import StratifiedGroupKFold
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C
-from imbalance import STRATEGIES, apply_adasyn, sample_weights
+from imbalance import STRATEGIES, apply_resample, sample_weights
 from models import build_features, make_lr, make_xgb
 
 N_FOLDS = 5
 PRED_DIR = os.path.join(C.OUT_DIR, 'preds')
+
+# Strategies that act on the training data rather than on the objective.
+RESAMPLING_STRATEGIES = ('adasyn', 'smote')
 
 
 def tag(model, strategy, use_rr, fold):
@@ -49,16 +53,28 @@ def fit_sklearn_like(kind, strategy, Xtr, rrtr, ytr, Xva, rrva, use_rr, seed):
     Fva = build_features(Xva, rrva, use_rr, C.SEGMENTS, kind)
 
     note = 'none'
-    if strategy == 'adasyn':
-        # Fitted on the training fold only — never the validation fold.
-        Ftr, ytr, note = apply_adasyn(Ftr, ytr, seed=seed)
+    # Resampling happens in FEATURE space, on Ftr — not on the raw
+    # waveform. For XGBoost that means ADASYN and SMOTE interpolate
+    # between morphology descriptors, where a midpoint is still a valid
+    # statistic. For LR, whose features ARE the raw waveform, they
+    # interpolate waveforms, exactly as in the CNN path below.
+    #
+    # Fitted on the training fold only — never the validation fold.
+    if strategy in RESAMPLING_STRATEGIES:
+        Ftr, ytr, note = apply_resample(Ftr, ytr, strategy, seed=seed)
+
+    # Both families take class weighting the same way, through
+    # sample_weight. imbalance.sample_weights() restricts the weights to
+    # config.EVAL_LABELS, so Q carries no gradient. LogisticRegression's
+    # own class_weight='balanced' would include Q and is not used.
+    sw = sample_weights(ytr) if strategy == 'class_weight' else None
 
     if kind == 'lr':
         model = make_lr(strategy, seed)
-        model.fit(Ftr, ytr)
+        fit_kw = {} if sw is None else {'logisticregression__sample_weight': sw}
+        model.fit(Ftr, ytr, **fit_kw)
     else:
         model = make_xgb(seed)
-        sw = sample_weights(ytr) if strategy == 'class_weight' else None
         model.fit(Ftr, ytr, sample_weight=sw, verbose=False)
 
     return model.predict_proba(Fva), {'resample': note, 'n_train': int(len(ytr))}
@@ -133,14 +149,24 @@ def run(models, strategies, rr_settings, subset=None, seed=0, epochs=40):
                     if model == 'cnn':
                         from train_cnn import train_cnn
                         Xtr, rrtr, ytr = X[tr], rr[tr], y[tr]
-                        if strategy == 'adasyn':
+                        note = 'none'
+                        # The CNN resamples in WAVEFORM space. The 216
+                        # waveform columns and the 4 RR columns are stacked
+                        # into one matrix, so the sampler interpolates both
+                        # together and the shape-to-timing correspondence is
+                        # not preserved in synthetic beats. This is the
+                        # counterpart to the feature-space path above.
+                        if strategy in RESAMPLING_STRATEGIES:
                             flat = np.hstack([Xtr, rrtr])
-                            flat, ytr, _ = apply_adasyn(flat, ytr, seed=seed)
-                            Xtr, rrtr = flat[:, :X.shape[1]], flat[:, X.shape[1]:]
+                            flat, ytr, note = apply_resample(
+                                flat, ytr, strategy, seed=seed)
+                            Xtr = flat[:, :X.shape[1]]
+                            rrtr = flat[:, X.shape[1]:]
                         proba, meta = train_cnn(
                             Xtr, rrtr, ytr, X[va], rr[va], y[va],
                             use_rr=use_rr, strategy=strategy,
                             epochs=epochs, seed=seed, verbose=False)
+                        meta['resample'] = note
                     else:
                         proba, meta = fit_sklearn_like(
                             model, strategy, X[tr], rr[tr], y[tr],
