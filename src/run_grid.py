@@ -1,13 +1,14 @@
 """
 Boxes 8 & 11 — run the experimental grid on DS1 with patient-grouped CV.
 
-    3 models x 4 imbalance strategies x 2 RR settings x 5 folds
+    3 models x 5 imbalance strategies x 2 RR settings x 5 folds
 
 DS2 is never opened by this script. Not once. That is the protocol.
 
 Macro-F1 is averaged over config.EVAL_CLASSES (N, S, V, F). Q is still a
 model output and its per-class F1 is still reported, but it is left out
-of the average — see the note in config.py for why.
+of the average — see the note in config.py for why. Q is also left out
+of the training objective entirely; see rule 5 in imbalance.py.
 
 Every fold writes its validation predictions to
 artifacts/preds/{model}_{strategy}_{rr}_f{fold}.npz, and the script skips
@@ -28,15 +29,80 @@ import time
 
 import numpy as np
 from sklearn.metrics import f1_score
-from sklearn.model_selection import StratifiedGroupKFold
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C
-from imbalance import STRATEGIES, apply_adasyn, sample_weights
+from imbalance import STRATEGIES, apply_resample, sample_weights
 from models import build_features, make_lr, make_xgb
 
 N_FOLDS = 5
 PRED_DIR = os.path.join(C.OUT_DIR, 'preds')
+FOLDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'folds.json')
+
+# Strategies that act on the training data rather than on the objective.
+RESAMPLING_STRATEGIES = ('adasyn', 'smote')
+
+
+def load_folds(y, pid):
+    """Read the frozen fold assignment from src/folds.json.
+
+    The folds are NOT recomputed here. StratifiedGroupKFold is deterministic
+    for a given scikit-learn version but not across versions: scikit-learn
+    1.6.1 (Colab) and 1.9.1 (laptop) partitioned the same 22 patients
+    differently, so the LR/XGBoost rows and the CNN rows of the Stage 2 grid
+    silently described different splits of DS1. Nothing errored; the two
+    halves simply were not comparable.
+
+    src/make_folds.py produced the file once. It records which fold each
+    PATIENT belongs to, so patient-disjointness is visible on inspection
+    rather than trusted.
+    """
+    if not os.path.exists(FOLDS_FILE):
+        raise FileNotFoundError(
+            f'{FOLDS_FILE} is missing.\n'
+            '  It is committed to the repository -- pull main, or ask for a '
+            'copy.\n'
+            '  Do NOT run make_folds.py to recreate it: a different '
+            'scikit-learn\n'
+            '  version produces a different split, which is the exact '
+            'problem this\n'
+            '  file exists to prevent.')
+
+    with open(FOLDS_FILE) as fh:
+        spec = json.load(fh)
+
+    assert spec['n_beats'] == len(y), (
+        f"folds.json is for {spec['n_beats']:,} beats, this ds1.npz has "
+        f'{len(y):,} — the dataset was rebuilt, so the folds no longer apply')
+
+    pf = {str(k): int(v) for k, v in spec['patient_fold'].items()}
+    missing = sorted({str(p) for p in np.unique(pid)} - set(pf))
+    assert not missing, f'patients absent from folds.json: {missing}'
+
+    assign = np.array([pf[str(p)] for p in pid])
+    idx = np.arange(len(y))
+    folds = [(idx[assign != f], idx[assign == f]) for f in range(spec['n_folds'])]
+
+    gen = spec.get('generated_with', {})
+    print(f"folds: {FOLDS_FILE} "
+          f"(frozen, made with sklearn {gen.get('sklearn', '?')})")
+    return folds
+
+
+def compute_folds_for_subset(X, y, pid, seed):
+    """Folds for a --subset smoke test only.
+
+    A subset is not the real dataset, so the frozen assignment does not
+    apply. These folds are version-dependent and the predictions they
+    produce must never be kept — the notebook deletes them, and the cache
+    guard in run() rejects them anyway.
+    """
+    from sklearn.model_selection import StratifiedGroupKFold
+    print('SMOKE TEST: folds computed on the fly, results are not usable')
+    gkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True,
+                               random_state=seed)
+    return list(gkf.split(X, y, groups=pid))
 
 
 def tag(model, strategy, use_rr, fold):
@@ -49,16 +115,28 @@ def fit_sklearn_like(kind, strategy, Xtr, rrtr, ytr, Xva, rrva, use_rr, seed):
     Fva = build_features(Xva, rrva, use_rr, C.SEGMENTS, kind)
 
     note = 'none'
-    if strategy == 'adasyn':
-        # Fitted on the training fold only — never the validation fold.
-        Ftr, ytr, note = apply_adasyn(Ftr, ytr, seed=seed)
+    # Resampling happens in FEATURE space, on Ftr — not on the raw
+    # waveform. For XGBoost that means ADASYN and SMOTE interpolate
+    # between morphology descriptors, where a midpoint is still a valid
+    # statistic. For LR, whose features ARE the raw waveform, they
+    # interpolate waveforms, exactly as in the CNN path below.
+    #
+    # Fitted on the training fold only — never the validation fold.
+    if strategy in RESAMPLING_STRATEGIES:
+        Ftr, ytr, note = apply_resample(Ftr, ytr, strategy, seed=seed)
+
+    # Both families take class weighting the same way, through
+    # sample_weight. imbalance.sample_weights() restricts the weights to
+    # config.EVAL_LABELS, so Q carries no gradient. LogisticRegression's
+    # own class_weight='balanced' would include Q and is not used.
+    sw = sample_weights(ytr) if strategy == 'class_weight' else None
 
     if kind == 'lr':
         model = make_lr(strategy, seed)
-        model.fit(Ftr, ytr)
+        fit_kw = {} if sw is None else {'logisticregression__sample_weight': sw}
+        model.fit(Ftr, ytr, **fit_kw)
     else:
         model = make_xgb(seed)
-        sw = sample_weights(ytr) if strategy == 'class_weight' else None
         model.fit(Ftr, ytr, sample_weight=sw, verbose=False)
 
     return model.predict_proba(Fva), {'resample': note, 'n_train': int(len(ytr))}
@@ -82,12 +160,12 @@ def run(models, strategies, rr_settings, subset=None, seed=0, epochs=40):
     # Box 8 — folds split by patient, never by beat. A plain KFold here
     # would silently re-create the leak Stage 1 exists to remove.
     #
-    # StratifiedGroupKFold rather than plain GroupKFold: both keep every
-    # patient inside one fold, but the stratified version also tries to
-    # balance class proportions across folds. On DS1 that matters for V —
-    # plain GroupKFold produced a fold holding just 2 V beats out of
-    # 3,788, and an F1 computed on 2 samples is noise that drags the
-    # pooled V score down.
+    # The assignment was made with StratifiedGroupKFold rather than plain
+    # GroupKFold: both keep every patient inside one fold, but the
+    # stratified version also balances class proportions across folds. On
+    # DS1 that matters for V — plain GroupKFold produced a fold holding
+    # just 2 V beats out of 3,788, and an F1 computed on 2 samples is
+    # noise that drags the pooled V score down.
     #
     # It cannot help S or F. Record 209 holds 383 of DS1's 943 S beats,
     # and record 208 holds 372 of its 414 F beats; a class concentrated
@@ -95,9 +173,11 @@ def run(models, strategies, rr_settings, subset=None, seed=0, epochs=40):
     # keeps patients intact. The cross-validated F score in particular is
     # not interpretable, which is a property of the database rather than
     # of this pipeline, and is worth stating in the paper.
-    gkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True,
-                               random_state=seed)
-    folds = list(gkf.split(X, y, groups=pid))
+    #
+    # That assignment is now READ FROM src/folds.json rather than
+    # recomputed — see load_folds().
+    folds = (compute_folds_for_subset(X, y, pid, seed) if subset
+             else load_folds(y, pid))
 
     for f, (tr, va) in enumerate(folds):
         overlap = set(pid[tr]) & set(pid[va])
@@ -133,14 +213,24 @@ def run(models, strategies, rr_settings, subset=None, seed=0, epochs=40):
                     if model == 'cnn':
                         from train_cnn import train_cnn
                         Xtr, rrtr, ytr = X[tr], rr[tr], y[tr]
-                        if strategy == 'adasyn':
+                        note = 'none'
+                        # The CNN resamples in WAVEFORM space. The 216
+                        # waveform columns and the 4 RR columns are stacked
+                        # into one matrix, so the sampler interpolates both
+                        # together and the shape-to-timing correspondence is
+                        # not preserved in synthetic beats. This is the
+                        # counterpart to the feature-space path above.
+                        if strategy in RESAMPLING_STRATEGIES:
                             flat = np.hstack([Xtr, rrtr])
-                            flat, ytr, _ = apply_adasyn(flat, ytr, seed=seed)
-                            Xtr, rrtr = flat[:, :X.shape[1]], flat[:, X.shape[1]:]
+                            flat, ytr, note = apply_resample(
+                                flat, ytr, strategy, seed=seed)
+                            Xtr = flat[:, :X.shape[1]]
+                            rrtr = flat[:, X.shape[1]:]
                         proba, meta = train_cnn(
                             Xtr, rrtr, ytr, X[va], rr[va], y[va],
                             use_rr=use_rr, strategy=strategy,
                             epochs=epochs, seed=seed, verbose=False)
+                        meta['resample'] = note
                     else:
                         proba, meta = fit_sklearn_like(
                             model, strategy, X[tr], rr[tr], y[tr],
