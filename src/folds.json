@@ -1,0 +1,38 @@
+{
+  "dataset": "ds1",
+  "n_folds": 5,
+  "seed": 0,
+  "n_beats": 50977,
+  "n_patients": 22,
+  "splitter": "StratifiedGroupKFold(shuffle=True)",
+  "generated_with": {
+    "python": "3.12.4",
+    "sklearn": "1.9.1",
+    "numpy": "2.5.3"
+  },
+  "note": "Frozen on purpose. StratifiedGroupKFold is not stable across scikit-learn versions; this file is the protocol. Do not regenerate.",
+  "patient_fold": {
+    "101": 1,
+    "106": 2,
+    "108": 2,
+    "109": 4,
+    "112": 3,
+    "114": 0,
+    "115": 2,
+    "116": 1,
+    "118": 0,
+    "119": 1,
+    "122": 4,
+    "124": 4,
+    "201": 2,
+    "203": 3,
+    "205": 2,
+    "207": 3,
+    "208": 0,
+    "209": 1,
+    "215": 0,
+    "220": 3,
+    "223": 4,
+    "230": 2
+  }
+}
