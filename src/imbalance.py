@@ -18,8 +18,39 @@ precision collapsed and how leaks get reintroduced:
      the other. They are being compared against each other, so a
      sampler that cannot fit must report the failure rather than
      silently becoming the one it is being compared with.
+  5. A class excluded from the METRIC is excluded from the OBJECTIVE.
+     Both the resampling strategy and the class weights are restricted
+     to config.EVAL_LABELS. See the note below — this was wrong in the
+     first version and it silently corrupted four of five folds.
+
+Why rule 5 exists
+-----------------
+DS1 holds 8 Class Q beats in total. Per training fold that lands as
+4, 6 or 8 depending on which patient the fold puts where:
+
+    fold 0: 6    fold 1: 6    fold 2: 8    fold 3: 4    fold 4: 8
+
+The first version guarded against this with MIN_SAMPLES_TO_RESAMPLE = 6,
+which does not work: 6 and 8 are not below 6. Two things followed.
+
+  * Resampling. Q entered the strategy in four of the five folds and
+    was oversampled from 6-8 real beats to roughly 12,800 synthetic
+    ones. Every adasyn row produced before this fix is void.
+
+  * Class weights. Inverse-frequency weighting makes every class
+    contribute equally to the loss, so 6 Q beats carried the same total
+    gradient as 36,659 N beats — a per-sample weight 126x that of S and
+    6,110x that of N. Every class_weight and focal row produced before
+    this fix is void, focal included, since it takes these weights as
+    its alpha.
+
+Restricting both to EVAL_LABELS fixes the cause rather than the symptom.
+MIN_SAMPLES_TO_RESAMPLE stays as a genuine neighbour guard for S, V and
+F in a pathological fold.
 """
 import numpy as np
+
+import config as C
 
 STRATEGIES = ['none', 'class_weight', 'focal', 'adasyn', 'smote']
 
@@ -29,9 +60,8 @@ STRATEGIES = ['none', 'class_weight', 'focal', 'adasyn', 'smote']
 CAP_RATIO = 0.35
 
 # A class needs at least this many samples in the training fold to be
-# synthesised from — interpolation needs neighbours. Below it, the class
-# is excluded from the resampling strategy rather than being allowed to
-# fail the whole call. See the comment in apply_resample.
+# synthesised from — interpolation needs neighbours. This is NOT the
+# mechanism that keeps Q out; EVAL_LABELS is. See the module docstring.
 MIN_SAMPLES_TO_RESAMPLE = 6
 
 # The two samplers spell the neighbour argument differently: ADASYN
@@ -41,20 +71,50 @@ MIN_SAMPLES_TO_RESAMPLE = 6
 _SAMPLERS = {'adasyn': 'n_neighbors', 'smote': 'k_neighbors'}
 
 
-def class_weights(y, n_classes=5):
-    """Inverse-frequency weights, normalised to mean 1."""
+def class_weights(y, n_classes=5, eval_labels=None):
+    """Inverse-frequency weights over the EVALUATED classes only.
+
+    Classes outside eval_labels get weight 0, so they contribute no
+    gradient. Among the evaluated classes the weights are normalised to
+    mean 1, which is the same relative scheme as sklearn's
+    class_weight='balanced'.
+    """
+    if eval_labels is None:
+        eval_labels = C.EVAL_LABELS
+
     counts = np.bincount(y, minlength=n_classes).astype(np.float64)
-    counts[counts == 0] = 1.0
-    w = counts.sum() / (n_classes * counts)
-    return (w / w.mean()).astype(np.float32)
+
+    mask = np.zeros(n_classes, dtype=bool)
+    mask[list(eval_labels)] = True
+    mask &= counts > 0                     # a class absent from this fold
+
+    w = np.zeros(n_classes, dtype=np.float64)
+    if not mask.any():                     # degenerate; should not happen
+        return np.ones(n_classes, dtype=np.float32)
+
+    c = counts[mask]
+    w[mask] = c.sum() / (mask.sum() * c)
+    w[mask] /= w[mask].mean()
+    return w.astype(np.float32)
 
 
-def sample_weights(y, n_classes=5):
-    """Per-sample weights for XGBoost / sklearn `sample_weight`."""
-    return class_weights(y, n_classes)[y]
+def sample_weights(y, n_classes=5, eval_labels=None):
+    """Per-sample weights for XGBoost / sklearn `sample_weight`.
+
+    Normalised so the MEAN SAMPLE weight is 1. That matters: the class
+    weights above are normalised across classes, which for N leaves a
+    per-sample weight near 0.0008. Handed to a regularised fit as-is,
+    that shrinks the data term relative to the L2 penalty and the model
+    underfits. Scaling to mean 1 keeps the effective regularisation
+    strength the same as an unweighted fit, which is also what
+    sklearn's 'balanced' does.
+    """
+    w = class_weights(y, n_classes, eval_labels)[y]
+    m = w.mean()
+    return (w / m).astype(np.float32) if m > 0 else w.astype(np.float32)
 
 
-def apply_resample(X, y, kind, cap_ratio=CAP_RATIO, seed=0):
+def apply_resample(X, y, kind, cap_ratio=CAP_RATIO, seed=0, eval_labels=None):
     """Oversample minorities to `cap_ratio` x majority count.
 
     `kind` is 'adasyn' or 'smote'. There is deliberately NO fallback
@@ -64,18 +124,24 @@ def apply_resample(X, y, kind, cap_ratio=CAP_RATIO, seed=0):
     A row of results produced by the other sampler would be worse than
     no row at all.
 
+    Only classes in eval_labels are synthesised — see rule 5 in the
+    module docstring.
+
     X must be 2-D. For the CNN the waveform and the RR columns are
     stacked into one matrix before this call and split afterwards, so
     the sampler interpolates both together — see the caveat in the
     module docstring of models.py. Interpolating between raw waveforms
     can produce beats that are not physiologically plausible, which is
-    both why the cap matters and why ADASYN is the best strategy for
-    XGBoost and the worst for the CNN.
+    both why the cap matters and why resampling helps a model fitted on
+    morphology descriptors and hurts one fitted on the waveform itself.
 
     Returns (X, y, note). The note records what actually happened and
     is written into each prediction file's metadata.
     """
     from imblearn.over_sampling import ADASYN, SMOTE
+
+    if eval_labels is None:
+        eval_labels = C.EVAL_LABELS
 
     sampler_cls = {'adasyn': ADASYN, 'smote': SMOTE}[kind]
     kw_name = _SAMPLERS[kind]
@@ -84,26 +150,21 @@ def apply_resample(X, y, kind, cap_ratio=CAP_RATIO, seed=0):
     n_major = counts.max()
     target = int(round(cap_ratio * n_major))
 
-    # Only classes currently below target are raised, and only to target.
+    # Only evaluated classes below target are raised, and only to target.
     #
-    # Classes with too few samples are left out of the strategy entirely.
-    # ADASYN and SMOTE both interpolate between a sample and its nearest
-    # neighbours of the same class, so a class with a handful of members
-    # cannot be synthesised from. Q is the usual culprit: 8 beats in DS1,
-    # which lands as 0-3 per fold.
-    #
-    # Leaving such a class IN the strategy makes the whole fit_resample
-    # call raise, which returns the data completely unresampled — so the
-    # 'adasyn' row comes out byte identical to the 'none' row and the
-    # comparison is silently void. That is exactly what happened before
-    # MIN_SAMPLES_TO_RESAMPLE existed. Excluding it lets S, V and F still
-    # be resampled, which is the point.
-    strategy = {c: target for c in range(5)
+    # A class with a handful of members additionally cannot be
+    # synthesised from at all — both samplers interpolate between a
+    # sample and its nearest same-class neighbours. Leaving such a class
+    # IN the strategy makes the whole fit_resample call raise, which
+    # returns the data completely unresampled, so the row comes out byte
+    # identical to the 'none' row and the comparison is silently void.
+    # That happened once already, before MIN_SAMPLES_TO_RESAMPLE existed.
+    strategy = {c: target for c in eval_labels
                 if MIN_SAMPLES_TO_RESAMPLE <= counts[c] < target}
     if not strategy:
         return X, y, 'skipped_no_eligible_class'
 
-    skipped = [c for c in range(5)
+    skipped = [c for c in eval_labels
                if 0 < counts[c] < MIN_SAMPLES_TO_RESAMPLE]
 
     note = '' if not skipped else \
@@ -134,7 +195,9 @@ def focal_loss_torch(logits, target, gamma=2.0, alpha=None):
 
         FL = -alpha_t * (1 - p_t)^gamma * log(p_t)
 
-    alpha: optional per-class tensor (defaults to uniform).
+    alpha: optional per-class tensor (defaults to uniform). When it comes
+    from class_weights() above, non-evaluated classes carry weight 0 and
+    so contribute nothing to the loss.
     """
     import torch
     import torch.nn.functional as F

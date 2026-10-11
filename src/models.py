@@ -21,6 +21,13 @@ def morphology_features(X, segments):
     Trees treat each input column independently, so handing XGBoost 216
     raw timepoints wastes it — it cannot see shape. These descriptors
     give it the shape information explicitly.
+
+    This is also the reason ADASYN and SMOTE behave differently for the
+    two model families: here they interpolate between statistics, where
+    a midpoint is still a valid statistic. On the raw waveform, which is
+    what LR and the CNN receive, a midpoint between two beats whose
+    R-peaks sit at different sample offsets is a smeared or doubled QRS
+    that no heart produces.
     """
     feats = [
         X.min(1), X.max(1), X.mean(1), X.std(1),
@@ -70,6 +77,13 @@ def make_lr(strategy, seed=0):
     Pipeline, not a pre-scaled array: scikit-learn fits the scaler on the
     training fold only when the pipeline is fitted, so the validation
     fold's statistics never leak backwards.
+
+    Class weighting is NOT set here. It used to be class_weight='balanced',
+    which weights all five classes including Q — and with 6-8 Q beats in
+    a training fold that hands Q a per-sample weight 126x that of S. The
+    caller now passes sample_weight built by imbalance.sample_weights(),
+    which is restricted to the evaluated classes. `strategy` is kept in
+    the signature so the call sites stay uniform.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import make_pipeline
@@ -77,10 +91,7 @@ def make_lr(strategy, seed=0):
 
     return make_pipeline(
         StandardScaler(),
-        LogisticRegression(
-            max_iter=2000, random_state=seed,
-            class_weight='balanced' if strategy == 'class_weight' else None,
-        ),
+        LogisticRegression(max_iter=2000, random_state=seed),
     )
 
 

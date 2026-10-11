@@ -7,7 +7,8 @@ DS2 is never opened by this script. Not once. That is the protocol.
 
 Macro-F1 is averaged over config.EVAL_CLASSES (N, S, V, F). Q is still a
 model output and its per-class F1 is still reported, but it is left out
-of the average — see the note in config.py for why.
+of the average — see the note in config.py for why. Q is also left out
+of the training objective entirely; see rule 5 in imbalance.py.
 
 Every fold writes its validation predictions to
 artifacts/preds/{model}_{strategy}_{rr}_f{fold}.npz, and the script skips
@@ -55,19 +56,25 @@ def fit_sklearn_like(kind, strategy, Xtr, rrtr, ytr, Xva, rrva, use_rr, seed):
     # Resampling happens in FEATURE space, on Ftr — not on the raw
     # waveform. For XGBoost that means ADASYN and SMOTE interpolate
     # between morphology descriptors, where a midpoint is still a valid
-    # statistic. That difference from the CNN path, which interpolates
-    # raw waveforms, is the whole basis of the ADASYN result.
+    # statistic. For LR, whose features ARE the raw waveform, they
+    # interpolate waveforms, exactly as in the CNN path below.
     #
     # Fitted on the training fold only — never the validation fold.
     if strategy in RESAMPLING_STRATEGIES:
         Ftr, ytr, note = apply_resample(Ftr, ytr, strategy, seed=seed)
 
+    # Both families take class weighting the same way, through
+    # sample_weight. imbalance.sample_weights() restricts the weights to
+    # config.EVAL_LABELS, so Q carries no gradient. LogisticRegression's
+    # own class_weight='balanced' would include Q and is not used.
+    sw = sample_weights(ytr) if strategy == 'class_weight' else None
+
     if kind == 'lr':
         model = make_lr(strategy, seed)
-        model.fit(Ftr, ytr)
+        fit_kw = {} if sw is None else {'logisticregression__sample_weight': sw}
+        model.fit(Ftr, ytr, **fit_kw)
     else:
         model = make_xgb(seed)
-        sw = sample_weights(ytr) if strategy == 'class_weight' else None
         model.fit(Ftr, ytr, sample_weight=sw, verbose=False)
 
     return model.predict_proba(Fva), {'resample': note, 'n_train': int(len(ytr))}
