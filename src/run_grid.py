@@ -36,9 +36,25 @@ from imbalance import STRATEGIES, apply_resample, sample_weights
 from models import build_features, make_lr, make_xgb
 
 N_FOLDS = 5
-PRED_DIR = os.path.join(C.OUT_DIR, 'preds')
 FOLDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           'folds.json')
+
+
+def pred_dir(seed):
+    """Where this seed's per-fold predictions live.
+
+    Seed 0 keeps the original flat path so the predictions already on disk
+    stay valid; every other seed writes to a sibling directory. Without
+    this the filenames would collide and a second seed would silently
+    overwrite the first — the predictions carry no seed in their name.
+    """
+    return (os.path.join(C.OUT_DIR, 'preds') if seed == 0
+            else os.path.join(C.OUT_DIR, f'preds_seed{seed}'))
+
+
+def summary_path(seed):
+    return (os.path.join(C.OUT_DIR, 'grid_summary.json') if seed == 0
+            else os.path.join(C.OUT_DIR, f'grid_summary_seed{seed}.json'))
 
 # Strategies that act on the training data rather than on the objective.
 RESAMPLING_STRATEGIES = ('adasyn', 'smote')
@@ -143,7 +159,10 @@ def fit_sklearn_like(kind, strategy, Xtr, rrtr, ytr, Xva, rrva, use_rr, seed):
 
 
 def run(models, strategies, rr_settings, subset=None, seed=0, epochs=40):
+    PRED_DIR = pred_dir(seed)
     os.makedirs(PRED_DIR, exist_ok=True)
+    if seed != 0:
+        print(f'seed {seed}: writing to {PRED_DIR}')
 
     d = np.load(os.path.join(C.OUT_DIR, 'ds1.npz'))
     X, rr, y, pid = d['X'], d['rr'], d['y'], d['pid']
@@ -271,6 +290,7 @@ def run(models, strategies, rr_settings, subset=None, seed=0, epochs=40):
 
                 summary.append({
                     'model': model, 'strategy': strategy, 'use_rr': bool(use_rr),
+                    'seed': int(seed),
                     'eval_classes': C.EVAL_CLASSES,
                     'macro_f1_mean': float(np.mean(f1s)),
                     'macro_f1_std': float(np.std(f1s)),
@@ -278,10 +298,10 @@ def run(models, strategies, rr_settings, subset=None, seed=0, epochs=40):
                                      for i, c in enumerate(C.CLASS_NAMES)},
                 })
 
-    with open(os.path.join(C.OUT_DIR, 'grid_summary.json'), 'w') as fh:
+    out = summary_path(seed)
+    with open(out, 'w') as fh:
         json.dump(summary, fh, indent=2)
-    print(f'\nWrote {len(summary)} configurations to '
-          f'{C.OUT_DIR}/grid_summary.json')
+    print(f'\nWrote {len(summary)} configurations to {out}')
     print(f'Per-fold predictions in {PRED_DIR}/ — Stages 3-5 read these.')
     return summary
 

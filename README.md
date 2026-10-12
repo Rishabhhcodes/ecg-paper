@@ -10,8 +10,9 @@ twice — identical model, identical folds, identical seed, with the RR features
 as the only difference.
 
 Across 13 model/strategy pairs spanning three model families, **RR features
-improved both macro-F1 and Class S F1 in 26 of 26 comparisons**, with Class S
-gains between 2.3× and 16.1×.
+improved both macro-F1 and Class S F1 in 26 of 26 comparisons** — every one of
+them by a margin larger than the run-to-run noise we measured across five
+seeds.
 
 ---
 
@@ -37,33 +38,59 @@ pipeline, and it explains why published F-class results vary so widely.
 ## Results so far
 
 Best configuration per model family, 5-fold patient-grouped CV inside DS1,
-macro-F1 over N/S/V/F:
+macro-F1 over N/S/V/F. The CNN was repeated across five seeds and is reported as
+the mean; logistic regression is deterministic and XGBoost moves by under 0.001,
+so neither was repeated.
 
-| Model | Best strategy | macro-F1 | S | V | F |
-|---|---|---|---|---|---|
-| 1D-CNN + RR fusion | class weighting | **0.5827 ± 0.112** | 0.346 | 0.810 | 0.183 |
-| XGBoost | SMOTE | 0.4994 ± 0.090 | 0.245 | 0.691 | 0.003 |
-| Logistic Regression | none | 0.3691 ± 0.056 | 0.145 | 0.405 | 0.010 |
+| Model | Best strategy | macro-F1 | Class S F1 |
+|---|---|---|---|
+| 1D-CNN + RR fusion | class weighting or focal — tied | **0.576** | 0.384 / 0.427 |
+| XGBoost | SMOTE or class weighting — tied | 0.499 | 0.245 / 0.260 |
+| Logistic Regression | none | 0.369 | 0.145 |
 
 Full 26-row grid: `artifacts/grid_summary.json` after running the grid.
+Cross-seed analysis: `python src/seed_report.py`.
 
 One result worth stating plainly. Comparing each imbalance strategy against no
 correction at all, on macro-F1:
 
 | Strategy | LR (raw waveform) | XGBoost (descriptors) | CNN (raw waveform) |
 |---|---|---|---|
-| class weighting | −0.071 | +0.017 | **+0.087** |
-| focal loss | — | — | **+0.072** |
-| SMOTE | −0.033 | +0.018 | +0.015 |
-| ADASYN | −0.079 | +0.010 | +0.001 |
+| class weighting | −0.071 | +0.017 | **+0.047** |
+| focal loss | — | — | **+0.047** |
+| SMOTE | −0.033 | +0.018 | −0.016 *(n.s.)* |
+| ADASYN | −0.079 | +0.010 | **−0.038** |
 
 On morphology descriptors, reweighting the loss and resampling the data are
-interchangeable. On raw waveforms, only reweighting the loss helps;
-interpolation-based oversampling adds almost nothing. Logistic regression is too
-weak a model for any correction to pay for itself.
+interchangeable and both help. On raw waveforms the two diverge: reweighting the
+loss gains 0.047, SMOTE is indistinguishable from applying no correction, and
+**ADASYN costs 0.038** — the only configuration in the grid that performs worse
+than doing nothing. The sampler is the same and the data is the same; only what
+the model looks at differs.
 
-These are single-seed results. Repeats across seeds are planned before any of
-the smaller differences above are claimed in writing.
+ADASYN rather than SMOTE because ADASYN concentrates its synthetic samples near
+the decision boundary, which on raw ECG is where the ambiguous and mislabelled
+beats sit. Logistic regression is too weak a model for any correction to pay for
+itself.
+
+### What cannot be ranked
+
+The CNN was run five times with everything fixed except its own initialisation.
+Measured spread: **macro-F1 ±0.0104** (worst configuration ±0.0196), **Class S
+F1 ±0.0436** (worst ±0.1650). A difference smaller than that is not a finding,
+so these are reported as ties:
+
+| Comparison | Gap | Noise |
+|---|---|---|
+| CNN class weighting vs focal (macro-F1) | +0.0009 | ±0.0178 |
+| CNN SMOTE vs ADASYN | +0.0220 | ±0.0313 |
+| XGBoost SMOTE vs class weighting | +0.0012 | — |
+| XGBoost class weighting vs ADASYN | +0.0066 | — |
+
+Two comparisons do survive: class weighting beats SMOTE on the CNN (+0.0631
+against ±0.0287), and **focal loss beats class weighting on Class S**
+(+0.0434 against ±0.0241) despite the two being tied on macro-F1. Since Class S
+is what this work is about, focal loss is the configuration to prefer.
 
 ---
 
