@@ -60,7 +60,41 @@ def load():
                             {})[s] = r
 
     seeds = sorted({s for v in runs.values() for s in v})
-    print(f'read {len(paths)} summaries, seeds {seeds}\n')
+    print(f'read {len(paths)} summaries, seeds {seeds}')
+
+    # That seed list is the UNION over every configuration, which is not
+    # the same thing as every configuration having every seed -- and once
+    # it was not. run_grid.py rebuilds its summary from scratch on each
+    # run, so a later `--models lr xgb` replaced a 26-row
+    # grid_summary.json with a 16-row one and took seed 0's ten CNN rows
+    # with it. The predictions were still on disk. This report averaged
+    # the CNN over four seeds while printing "seeds [0, 1, 2, 3, 4]",
+    # which it had read from the LR and XGBoost rows.
+    #
+    # Every mean below is only as good as the seeds behind it, so a
+    # configuration missing one is named before anything is reported.
+    #
+    # Compared against the seeds that model actually has, not the global
+    # union. Only the CNN was repeated -- logistic regression is
+    # deterministic and XGBoost moves by under 0.001 -- so measuring LR
+    # and XGBoost against the union would report all sixteen of their
+    # rows as missing four seeds on every single run. A warning that
+    # fires when nothing is wrong is a warning nobody reads.
+    model_seeds = {}
+    for (m, _, _), v in runs.items():
+        model_seeds.setdefault(m, set()).update(v)
+    short = {k: sorted(model_seeds[k[0]] - set(v)) for k, v in runs.items()
+             if len(v) < len(model_seeds[k[0]])}
+    if short:
+        print(f'\n*** {len(short)} configuration(s) are missing a seed. '
+              'Their means and spreads\n*** below are computed over fewer '
+              'runs than that header implies.')
+        for k in sorted(short):
+            print(f'      {k[0]:4} {k[1]:13} {"rr" if k[2] else "norr":4} '
+                  f'   missing seed(s) {short[k]}')
+        print('*** Fix: python src/rebuild_summary.py --write, then re-run '
+              'this.')
+    print()
     return runs, seeds
 
 
@@ -162,24 +196,39 @@ def main():
         ('xgb', 'smote', 'xgb', 'class_weight'),
         ('xgb', 'class_weight', 'xgb', 'adasyn'),
     ]
+    # Checked on Class S as well as macro-F1. This section used to report
+    # macro-F1 only, and the claim that mattered most -- that focal loss
+    # beats class weighting on Class S, the class this whole project is
+    # about -- was a CLASS S claim. It therefore never passed through this
+    # rule at all, and went into the README on a hand calculation over a
+    # summary that was silently missing a seed. Class S is also the noisier
+    # of the two by a factor of four, so it is the one that most needs it.
     for m1, s1, m2, s2 in pairs:
-        a = agg(runs, (m1, s1, True), 'macro-F1')
-        b = agg(runs, (m2, s2, True), 'macro-F1')
-        if not a or not b:
-            continue
-        gap = a[0] - b[0]
-        noise = (a[1] + b[1]) / 2
-        if abs(gap) > noise and noise > 0:
-            verdict = f'RANKABLE — {s1 if gap > 0 else s2} is ahead'
-        else:
-            verdict = 'NOT rankable — report as indistinguishable'
         print(f'  {m1} {s1} vs {s2}')
-        print(f'      {a[0]:.4f} vs {b[0]:.4f}   gap {gap:+.4f}   '
-              f'noise ±{noise:.4f}')
-        print(f'      {verdict}\n')
+        for what in ('macro-F1', 'S'):
+            a = agg(runs, (m1, s1, True), what)
+            b = agg(runs, (m2, s2, True), what)
+            if not a or not b:
+                continue
+            gap = a[0] - b[0]
+            noise = (a[1] + b[1]) / 2
+            n = min(a[2], b[2])
+            if n < 2:
+                verdict = (f'only {n} seed — noise unknown, NOT rankable '
+                           '(this is not a tie)')
+            elif abs(gap) > noise:
+                verdict = f'RANKABLE — {s1 if gap > 0 else s2} is ahead'
+            else:
+                verdict = 'NOT rankable — report as indistinguishable'
+            print(f'      {what:9} {a[0]:.4f} vs {b[0]:.4f}   '
+                  f'gap {gap:+.4f}   noise ±{noise:.4f}')
+            print(f'      {"":9} {verdict}')
+        print()
 
     print('Rule used: a gap counts only if it exceeds the combined')
-    print('half-range of the two configurations across seeds.')
+    print('half-range of the two configurations across seeds. A pair with')
+    print('one seed has no measured noise and cannot be ranked either way;')
+    print('that is different from a measured tie.')
     return 0
 
 
