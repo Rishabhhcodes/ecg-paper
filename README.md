@@ -317,7 +317,8 @@ Stated here rather than left to be discovered.
 | 5 | Explainability and efficiency analysis | Not started |
 
 Team workflow and branch conventions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
-Stage notes: [`docs/stage1.md`](docs/stage1.md), [`docs/stage2.md`](docs/stage2.md).
+Stage notes: [`docs/stage1.md`](docs/stage1.md), [`docs/stage2.md`](docs/stage2.md),
+[`docs/stage3.md`](docs/stage3.md).
 
 ### References
 

@@ -9,12 +9,19 @@ import numpy as np
 
 def train_cnn(Xtr, rrtr, ytr, Xva, rrva, yva, *, use_rr, strategy,
               epochs=60, batch=128, lr=1e-3, patience=12, min_epochs=20, seed=0,
-              device=None, verbose=True):
+              device=None, verbose=True, predict_extra=None):
     """Train one CNN and return validation probabilities.
 
     Early stopping is on validation macro-F1, not loss. With this level
     of imbalance, loss keeps improving while minority classes get worse,
     so stopping on loss selects the wrong epoch.
+
+    predict_extra -- optional (X, rr) for a further set to score with the
+    restored best-epoch model, returned as meta['proba_extra']. Added for
+    Stage 4, where the model must be fitted on DS1 (with one fold held
+    out for early stopping) and then applied to DS2, which must never be
+    seen during fitting. Default None, so every existing call behaves
+    exactly as before.
     """
     import torch
     import torch.nn as nn
@@ -103,9 +110,26 @@ def train_cnn(Xtr, rrtr, ytr, Xva, rrva, yva, *, use_rr, strategy,
             break
 
     model.load_state_dict(best_state)
-    return best_proba, {
+
+    meta = {
         'best_epoch': int(best_epoch),
         'best_val_macro_f1': float(best_f1),
         'params': int(count_params(model)),
         'device': str(device),
     }
+
+    # Scored after the best epoch's weights are restored, so this is the
+    # same model the returned validation probabilities describe -- not
+    # the last epoch's. Nothing here feeds back into training.
+    if predict_extra is not None:
+        Xex, rrex = predict_extra
+        Xex_t, rrex_t = to_t(Xex).to(device), to_t(rrex).to(device)
+        model.eval()
+        with torch.no_grad():
+            chunks = []
+            for i in range(0, len(Xex_t), 2048):
+                out = model(Xex_t[i:i + 2048], rrex_t[i:i + 2048])
+                chunks.append(torch.softmax(out, 1).cpu().numpy())
+        meta['proba_extra'] = np.vstack(chunks)
+
+    return best_proba, meta
