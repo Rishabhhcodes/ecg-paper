@@ -154,6 +154,47 @@ Figures in `artifacts/stage3/`: `reliability.png`, `arc.png`, `pr_class_s.png`.
 
 ---
 
+## Stage 4 — the evaluation on DS2
+
+Four configurations, locked on Stage 2 evidence, trained on DS1 and applied once
+to the 22 held-out patients. 22 October 2026, 9.2 minutes on a T4.
+
+| Configuration | macro-F1 | Class S Se / +P | Class S F1 |
+|---|---:|---|---:|
+| CNN + class weighting | 0.6181 ±0.0113 | **0.877 / 0.386** | **0.536** |
+| CNN + focal loss | 0.5837 ±0.0400 | 0.872 / 0.368 | 0.518 |
+| XGBoost + class weighting | **0.6194** | 0.371 / 0.391 | 0.381 |
+| Logistic regression, none | 0.5531 | 0.344 / 0.567 | 0.428 |
+
+**Macro-F1 cannot separate the top two, and they are not comparable.** XGBoost
+scores 0.6194 and the CNN 0.6181 — a gap of 0.0013 against a noise floor of
+±0.0113. On the class this work exists to detect, the CNN catches **87.7%** of
+the 1,836 S beats and XGBoost **37.1%**: 226 missed against 1,155. XGBoost
+recovers the difference on Class N, which is 89% of the set.
+
+A macro average is used in this literature precisely to stop the majority class
+dominating. Here it still fails to separate a model that finds the target class
+from one that misses two thirds of it. Per-class sensitivity, reported alongside,
+makes it obvious — which is what the AAMI convention asks for.
+
+**The development protocol predicted generalisation correctly.** DS2 macro-F1 is
+higher than the DS1 cross-validated figure everywhere, which normally signals a
+leak. It does not here: Class S prevalence is 1.85% in DS1 and 3.70% in DS2,
+exactly twice, and precision rises with prevalence. Re-scored at DS1's
+prevalence, the CNN's Class S F1 is **0.372** against the **0.376** that
+cross-validation reported — within 0.004.
+
+**Stage 2's refusals survived.** Class weighting and focal loss remained
+unrankable on DS2, as on DS1.
+
+**Class F is unusable**, with positive predictivity between 0.049 and 0.148 —
+the limitation declared in Stage 1, before any model was trained.
+
+Full record, including why the evaluation ran twice and why that does not change
+the result: [`docs/stage4.md`](docs/stage4.md).
+
+---
+
 ## Reproducing
 
 Requires Python 3.11+. `pip install -r requirements.txt`.
@@ -219,10 +260,14 @@ python src/rebuild_summary.py --write   # regenerate from the .npz files
 Neither can train anything. When a summary and the predictions disagree, the
 predictions win.
 
-**DS2 stays sealed until Stage 4.** Not one hyperparameter, architecture choice,
-loss function or threshold in this project has been selected using DS2. That is
-what makes the Stage 4 number an honest estimate of generalisation rather than a
-figure tuned toward.
+**DS2 was opened once, in Stage 4, and is finished with.** Not one
+hyperparameter, architecture choice, loss function or threshold in Stages 1–3
+was selected using DS2, which is what makes the Stage 4 number an estimate of
+generalisation rather than a figure tuned toward. It has now been evaluated and
+must not be touched again — the per-beat outputs were deliberately not kept, so
+there is nothing further to extract without a second opening. See
+[`docs/stage4.md`](docs/stage4.md), which also records that the evaluation ran
+twice and why that does not change the result.
 
 ---
 
@@ -313,12 +358,12 @@ Stated here rather than left to be discovered.
 | 1 | Dataset build under the inter-patient protocol | Complete |
 | 2 | Model and imbalance-strategy grid, RR ablation | Complete |
 | 3 | Decision layer — calibration, thresholds, reject option | Complete |
-| 4 | Final evaluation on DS2 | Not started |
+| 4 | Final evaluation on DS2 | Complete — opened once, 22 Oct 2026 |
 | 5 | Explainability and efficiency analysis | Not started |
 
 Team workflow and branch conventions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 Stage notes: [`docs/stage1.md`](docs/stage1.md), [`docs/stage2.md`](docs/stage2.md),
-[`docs/stage3.md`](docs/stage3.md).
+[`docs/stage3.md`](docs/stage3.md), [`docs/stage4.md`](docs/stage4.md).
 
 ### References
 
