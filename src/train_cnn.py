@@ -9,7 +9,8 @@ import numpy as np
 
 def train_cnn(Xtr, rrtr, ytr, Xva, rrva, yva, *, use_rr, strategy,
               epochs=60, batch=128, lr=1e-3, patience=12, min_epochs=20, seed=0,
-              device=None, verbose=True, predict_extra=None):
+              device=None, verbose=True, predict_extra=None,
+              return_model=False):
     """Train one CNN and return validation probabilities.
 
     Early stopping is on validation macro-F1, not loss. With this level
@@ -22,6 +23,12 @@ def train_cnn(Xtr, rrtr, ytr, Xva, rrva, yva, *, use_rr, strategy,
     out for early stopping) and then applied to DS2, which must never be
     seen during fitting. Default None, so every existing call behaves
     exactly as before.
+
+    return_model -- when True, the fitted module (best-epoch weights,
+    eval mode) is returned as meta['model']. Stage 5 needs the model
+    itself, not its predictions, because occlusion attribution re-runs
+    the forward pass with parts of the input replaced. Default False, so
+    nothing else is affected.
     """
     import torch
     import torch.nn as nn
@@ -121,6 +128,10 @@ def train_cnn(Xtr, rrtr, ytr, Xva, rrva, yva, *, use_rr, strategy,
     # Scored after the best epoch's weights are restored, so this is the
     # same model the returned validation probabilities describe -- not
     # the last epoch's. Nothing here feeds back into training.
+    if return_model:
+        model.eval()
+        meta['model'] = model
+
     if predict_extra is not None:
         Xex, rrex = predict_extra
         Xex_t, rrex_t = to_t(Xex).to(device), to_t(rrex).to(device)
