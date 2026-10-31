@@ -144,34 +144,59 @@ def attribution(model, X, rr, y, base_X, base_rr, device):
 
 # ---------------------------------------------------------- faithfulness
 
-def curves(model, X, rr, y, base_X, base_rr, device, order):
-    """Deletion and insertion scores as units are removed / added in `order`.
+def curves(model, X, rr, y, base_X, base_rr, device, order, cls):
+    """Deletion and insertion curves FOR ONE CLASS.
 
     Deletion starts from the intact beat and removes units one at a time;
     insertion starts from an all-baseline input and adds them back. The
-    quantity tracked is the mean probability of the true class.
+    quantity tracked is the mean P(cls) over the beats that really are
+    cls.
+
+    Restricting both the ordering and the measurement to one class is not
+    a refinement, it is the difference between a valid test and an
+    invalid one. The first version of this function pooled every class
+    and ordered the units by the pooled attribution. Two things went
+    wrong and they compounded:
+
+      - 89% of beats are class N, whose attributions are near zero, so
+        the pooled ordering was noise. Fifteen runs produced nine
+        different orderings, and the test then compared noise against
+        random.
+
+      - With every region masked the model falls back on its prior, which
+        is class N. Pooled P(true class) therefore RECOVERED at the fully
+        masked end: the deletion curve was U-shaped, ending higher than
+        it started in 12 of 15 runs, so its area measured almost nothing.
+
+    Per class, neither happens: the ordering comes from a signal that is
+    actually there, and masking everything drives P(cls) toward the prior
+    for cls, which for a minority class is near zero.
     """
-    idx = np.arange(len(y))
+    i = C.CLASS_TO_INT[cls]
+    m = y == i
+    if m.sum() < 20:
+        return None, None
+    Xm, rrm = X[m], rr[m]
 
-    def mean_true(Xc, rrc):
-        return float(predict(model, Xc, rrc, device)[idx, y].mean())
+    def mean_p(Xc, rrc):
+        return float(predict(model, Xc, rrc, device)[:, i].mean())
 
-    dele, Xc, rrc = [mean_true(X, rr)], X.copy(), rr.copy()
+    dele, Xc, rrc = [mean_p(Xm, rrm)], Xm.copy(), rrm.copy()
     for u in order:
         Xc, rrc = occlude(Xc, rrc, u, base_X, base_rr)
-        dele.append(mean_true(Xc, rrc))
+        dele.append(mean_p(Xc, rrc))
 
-    Xi, rri = X.copy(), rr.copy()
+    Xi, rri = Xm.copy(), rrm.copy()
     for u in units():                                  # start fully masked
         Xi, rri = occlude(Xi, rri, u, base_X, base_rr)
-    ins = [mean_true(Xi, rri)]
+    ins = [mean_p(Xi, rri)]
     for u in order:
         if u == RR_UNIT:
-            rri = rr.copy()
+            rri = rrm.copy()
         else:
             lo, hi = C.SEGMENTS[u]
-            Xi[:, lo:hi] = X[:, lo:hi]
-        ins.append(mean_true(Xi, rri))
+            Xi[:, lo:hi] = Xm[:, lo:hi]
+        ins.append(mean_p(Xi, rri))
     return dele, ins
 
 
@@ -274,24 +299,35 @@ def main():
             att, per_unit = attribution(model, X[va], rr[va], y[va],
                                         base_X, base_rr, device)
 
-            order = sorted(units(), key=lambda u: -att['ALL'][u])
+            # Ordering and measurement are both per class. Ordering on the
+            # pooled row put class N -- 89% of beats, attributions near
+            # zero -- in charge of the ordering, which made it noise.
             rng = np.random.default_rng(seed * 100 + f)
-            rand = list(rng.permutation(units()))
-            dele, ins = curves(model, X[va], rr[va], y[va],
-                               base_X, base_rr, device, order)
-            dele_r, ins_r = curves(model, X[va], rr[va], y[va],
-                                   base_X, base_rr, device, rand)
+            faith = {}
+            for c in C.EVAL_CLASSES:
+                if c not in att:
+                    continue
+                order = sorted(units(), key=lambda u: -att[c][u])
+                rand = list(rng.permutation(units()))
+                de, ii = curves(model, X[va], rr[va], y[va],
+                                base_X, base_rr, device, order, c)
+                if de is None:                       # too few beats of c
+                    continue
+                dr_, ir_ = curves(model, X[va], rr[va], y[va],
+                                  base_X, base_rr, device, rand, c)
+                faith[c] = {'order': order, 'random_order': rand,
+                            'deletion': de, 'insertion': ii,
+                            'deletion_random': dr_, 'insertion_random': ir_}
 
             if eff is None:
                 eff = efficiency(model, X[va], rr[va], device)
 
             runs.append({'seed': seed, 'fold': f, 'attribution': att,
-                         'order': order, 'random_order': rand,
-                         'deletion': dele, 'insertion': ins,
-                         'deletion_random': dele_r, 'insertion_random': ins_r,
+                         'faithfulness': faith,
                          'best_epoch': meta.get('best_epoch')})
-            print(f'  seed {seed} fold {f}  order {" > ".join(order):22}'
-                  f'  del-AUC {auc(dele):.4f} vs random {auc(dele_r):.4f}'
+            tops = '  '.join(f'{c}:{max(units(), key=lambda u: att[c][u])}'
+                             for c in C.EVAL_CLASSES if c in att)
+            print(f'  seed {seed} fold {f}  top unit  {tops:34}'
                   f'   [{time.time() - t0:.0f}s]', flush=True)
             del model
             if device == 'cuda':
@@ -326,22 +362,33 @@ def main():
     print('Deleting regions in attributed order should degrade the model')
     print('faster than deleting them at random. Lower deletion AUC is better;')
     print('higher insertion AUC is better.\n')
-    da = [auc(r['deletion']) for r in runs]
-    dr = [auc(r['deletion_random']) for r in runs]
-    ia = [auc(r['insertion']) for r in runs]
-    ir = [auc(r['insertion_random']) for r in runs]
-    wins = sum(x < z for x, z in zip(da, dr))
-    print(f'  deletion  AUC  attributed {np.mean(da):.4f}   '
-          f'random {np.mean(dr):.4f}   better in {wins}/{len(runs)} runs')
-    wins_i = sum(x > z for x, z in zip(ia, ir))
-    print(f'  insertion AUC  attributed {np.mean(ia):.4f}   '
-          f'random {np.mean(ir):.4f}   better in {wins_i}/{len(runs)} runs')
-
     from collections import Counter
-    oc = Counter(' > '.join(r['order']) for r in runs)
-    print('\n  orderings found across runs:')
-    for o, k in oc.most_common():
-        print(f'    {k:>2}/{len(runs)}  {o}')
+    print(f"{'class':6} {'runs':>5}  {'deletion':>21}  {'insertion':>21}")
+    print(f"{'':6} {'':>5}  {'attrib  random  wins':>21}"
+          f"  {'attrib  random  wins':>21}")
+    print('-' * 74)
+    for c in C.EVAL_CLASSES:
+        rs = [r['faithfulness'][c] for r in runs if c in r['faithfulness']]
+        if not rs:
+            continue
+        da = [auc(x['deletion']) for x in rs]
+        dr = [auc(x['deletion_random']) for x in rs]
+        ia = [auc(x['insertion']) for x in rs]
+        ir = [auc(x['insertion_random']) for x in rs]
+        wd = sum(x < z for x, z in zip(da, dr))
+        wi = sum(x > z for x, z in zip(ia, ir))
+        print(f'{c:6} {len(rs):>5}  {np.mean(da):6.4f}  {np.mean(dr):6.4f}'
+              f'  {wd:>2}/{len(rs):<2}  {np.mean(ia):6.4f}  {np.mean(ir):6.4f}'
+              f'  {wi:>2}/{len(rs):<2}')
+    print('\n  Lower deletion and higher insertion than random means the')
+    print('  attributed ordering is informative for that class.')
+    for c in C.EVAL_CLASSES:
+        rs = [r['faithfulness'][c] for r in runs if c in r['faithfulness']]
+        if not rs:
+            continue
+        oc = Counter(' > '.join(x['order']) for x in rs)
+        o, k = oc.most_common(1)[0]
+        print(f'    {c}: most common ordering {o}  ({k}/{len(rs)} runs)')
 
     print('\n' + '=' * 74)
     print('EFFICIENCY')
@@ -396,27 +443,41 @@ def make_figures(res, outdir):
     fig.savefig(os.path.join(outdir, 'attribution.png'), dpi=150)
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(9.6, 4.0), layout='constrained')
+    present = [c for c in C.EVAL_CLASSES
+               if any(c in r['faithfulness'] for r in runs)]
     xs = list(range(len(U) + 1))
-    for ax, key, rkey, title, yl in (
-            (axes[0], 'deletion', 'deletion_random', 'Deletion',
-             'regions removed'),
-            (axes[1], 'insertion', 'insertion_random', 'Insertion',
-             'regions restored')):
-        A = np.array([r[key] for r in runs])
-        B = np.array([r[rkey] for r in runs])
-        ax.plot(xs, A.mean(0), 'o-', color='#4C78A8', label='attributed order')
-        ax.fill_between(xs, A.min(0), A.max(0), color='#4C78A8', alpha=0.15, lw=0)
-        ax.plot(xs, B.mean(0), 's--', color='#999999', label='random order')
-        ax.fill_between(xs, B.min(0), B.max(0), color='#999999', alpha=0.15, lw=0)
-        ax.set_title(title, fontsize=11)
-        ax.set_xlabel(yl)
-        ax.set_ylabel('mean P(true class)')
-        ax.set_xticks(xs)
-        ax.grid(alpha=0.25)
-        ax.legend(fontsize=8)
-    fig.suptitle('Faithfulness — does the attributed ordering matter?',
-                 fontsize=11)
+    fig, axes = plt.subplots(2, len(present),
+                             figsize=(3.1 * len(present), 6.2),
+                             layout='constrained', squeeze=False)
+    for j, c in enumerate(present):
+        rs = [r['faithfulness'][c] for r in runs if c in r['faithfulness']]
+        for i, (key, rkey, title) in enumerate((
+                ('deletion', 'deletion_random', 'deletion'),
+                ('insertion', 'insertion_random', 'insertion'))):
+            ax = axes[i][j]
+            A = np.array([x[key] for x in rs])
+            B = np.array([x[rkey] for x in rs])
+            ax.plot(xs, A.mean(0), 'o-', color='#4C78A8', ms=4,
+                    label='attributed')
+            ax.fill_between(xs, A.min(0), A.max(0), color='#4C78A8',
+                            alpha=0.15, lw=0)
+            ax.plot(xs, B.mean(0), 's--', color='#999999', ms=4,
+                    label='random')
+            ax.fill_between(xs, B.min(0), B.max(0), color='#999999',
+                            alpha=0.15, lw=0)
+            ax.set_title(f'class {c} — {title}', fontsize=9)
+            ax.set_xlabel('regions ' + ('removed' if i == 0 else 'restored'),
+                          fontsize=8)
+            if j == 0:
+                ax.set_ylabel(f'mean P({c})', fontsize=8)
+            ax.set_xticks(xs)
+            ax.tick_params(labelsize=8)
+            ax.grid(alpha=0.25)
+            if i == 0 and j == 0:
+                ax.legend(fontsize=8)
+    fig.suptitle('Faithfulness, per class — does the attributed ordering '
+                 'matter?\nordering and score both restricted to the class',
+                 fontsize=10)
     fig.savefig(os.path.join(outdir, 'faithfulness.png'), dpi=150)
     plt.close(fig)
 
