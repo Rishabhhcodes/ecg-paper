@@ -195,6 +195,51 @@ the result: [`docs/stage4.md`](docs/stage4.md).
 
 ---
 
+## Stage 5 — what the model actually leans on
+
+The RR ablation shows that *removing* the timing features destroys Class S
+performance. It does not show that the trained model **uses** them. Stage 5
+asks the model directly: each region of the beat is replaced by the
+training-fold mean and the drop in the model's confidence is measured. 3 seeds
+× 5 folds, DS1 only, on beats each model did not train on.
+
+Mean drop in P(true class) when a region is removed:
+
+| Class | P | QRS | T | RR | Top region |
+|---|---:|---:|---:|---:|---|
+| N | 0.015 | −0.058 | 0.029 | −0.057 | none — all near zero |
+| **S** | −0.019 | **−0.216** | −0.007 | **+0.450** | **RR, 15/15 runs** |
+| **V** | 0.059 | **+0.647** | 0.123 | 0.413 | QRS, 12/15 runs |
+| F | −0.024 | 0.158 | −0.038 | 0.059 | QRS, 9/12 runs |
+
+**RR is the top region for Class S in every run.** For Class V it is QRS —
+which is what a ventricular ectopic beat is defined by. The attribution
+recovers textbook cardiology without being told any of it.
+
+The negative number is the one worth reading twice. For Class S, removing the
+QRS complex *raises* the model's confidence. Morphology is not weak evidence
+for an S beat, it is evidence against, and the timing has to overcome it —
+consistent with the clinical definition of a beat that is premature but
+conducted normally.
+
+Restoring RR alone, to a beat where everything else is masked, takes P(S) to
+**0.688 — higher than on the intact beat (0.453)**.
+
+**The attribution was checked, not just reported.** Deleting regions in the
+attributed order drops Class S to 0.061 against 0.285 for a random order, and
+insertion beats random in 15 runs out of 15.
+
+So three independent methods agree: the ablation, the occlusion, and the
+faithfulness test. None depends on the others.
+
+**Efficiency.** 146,189 parameters, 0.585 MB, 0.168 ms per beat on one CPU core
+— a 24-hour Holter recording of ~100,000 beats in about 17 seconds.
+
+Full record, including the first version of the faithfulness test and why it
+was invalid: [`docs/stage5.md`](docs/stage5.md).
+
+---
+
 ## Reproducing
 
 Requires Python 3.11+. `pip install -r requirements.txt`.
@@ -359,11 +404,12 @@ Stated here rather than left to be discovered.
 | 2 | Model and imbalance-strategy grid, RR ablation | Complete |
 | 3 | Decision layer — calibration, thresholds, reject option | Complete |
 | 4 | Final evaluation on DS2 | Complete — opened once, 22 Oct 2026 |
-| 5 | Explainability and efficiency analysis | Not started |
+| 5 | Explainability and efficiency analysis | Complete |
 
 Team workflow and branch conventions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 Stage notes: [`docs/stage1.md`](docs/stage1.md), [`docs/stage2.md`](docs/stage2.md),
-[`docs/stage3.md`](docs/stage3.md), [`docs/stage4.md`](docs/stage4.md).
+[`docs/stage3.md`](docs/stage3.md), [`docs/stage4.md`](docs/stage4.md),
+[`docs/stage5.md`](docs/stage5.md).
 
 ### References
 
